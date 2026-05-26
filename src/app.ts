@@ -30,6 +30,8 @@ import communityRoutes from "./routes/community.routes"
 import proRoutes from "./routes/pro.routes"
 import economyRoutes from "./routes/economy.routes"
 
+import proChatRoutes from "./routes/proChat.routes"
+
 const app = express()
 
 app.use(
@@ -85,5 +87,7 @@ app.use("/api/economy", economyRoutes)
 
 app.use("/api/reports", reportRoutes)
 app.use("/api/announcements", announcementRoutes)
+
+app.use("/api/pro-chats", proChatRoutes)
 
 export default app

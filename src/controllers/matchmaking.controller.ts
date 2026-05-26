@@ -6,14 +6,47 @@ function generateRoomCode() {
   return `MBAR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`
 }
 
+async function getActiveUserRoom(userId: string) {
+  const { data, error } = await supabase
+    .from("party_members")
+    .select(`
+      id,
+      party_room_id,
+      party_rooms (
+        id,
+        title,
+        status,
+        room_type
+      )
+    `)
+    .eq("user_id", userId)
+
+  if (error) return null
+
+  return (
+    data?.find((member: any) => {
+      return member.party_rooms && member.party_rooms.status !== "closed"
+    }) || null
+  )
+}
+
+function activeRoomResponse(res: Response) {
+  return res.status(400).json({
+    code: "ACTIVE_ROOM_EXISTS",
+    message: "Kamu sudah berada di room lain. Keluar dulu untuk masuk room ini.",
+  })
+}
+
 export async function searchPartyRooms(req: Request, res: Response) {
-  const { gameId, rank, role, region, status = "open" } = req.query
+  const { gameId, rank, role, region, status } = req.query
 
   let query = supabase
     .from("party_rooms")
     .select(`
       id,
       owner_id,
+      game_id,
+      chat_id,
       title,
       description,
       room_type,
@@ -27,6 +60,7 @@ export async function searchPartyRooms(req: Request, res: Response) {
       average_rank,
       owner_left_at,
       cooldown_until,
+      expires_at,
       created_at,
       games (
         id,
@@ -50,24 +84,70 @@ export async function searchPartyRooms(req: Request, res: Response) {
   if (status) query = query.eq("status", status)
   if (role) query = query.contains("missing_roles", [role])
 
-  const { data, error } = await query.order("created_at", {
+  const { data: rooms, error } = await query.order("created_at", {
     ascending: false,
   })
 
   if (error) {
-    console.log("SEARCH PARTY ROOMS ERROR:", error)
-
     return res.status(400).json({
       message: error.message,
       details: error,
     })
   }
 
-  return res.json(data)
+  const userIds = [
+    ...new Set(
+      (rooms || [])
+        .flatMap((room: any) => room.party_members || [])
+        .map((member: any) => member.user_id)
+        .filter(Boolean)
+    ),
+  ]
+
+  let profiles: any[] = []
+
+  if (userIds.length > 0) {
+const { data: profileData, error: profileError } = await supabase
+  .from("profiles")
+  .select(`
+    id,
+    username,
+    display_name,
+    avatar_url,
+    online_status
+  `)
+      .in("id", userIds)
+
+    if (profileError) {
+      return res.status(400).json({
+        message: profileError.message,
+        details: profileError,
+      })
+    }
+
+    profiles = profileData || []
+  }
+
+  const profilesMap = new Map(
+    profiles.map((profile: any) => [profile.id, profile])
+  )
+
+  const finalRooms = (rooms || []).map((room: any) => ({
+    ...room,
+    party_members: (room.party_members || []).map((member: any) => ({
+      ...member,
+      profiles: profilesMap.get(member.user_id) || null,
+    })),
+  }))
+
+  return res.json(finalRooms)
 }
 
 export async function createPartyRoom(req: Request, res: Response) {
   const ownerId = req.user.id
+
+  const activeRoom = await getActiveUserRoom(ownerId)
+  if (activeRoom) return activeRoomResponse(res)
 
   const {
     game_id,
@@ -105,6 +185,7 @@ export async function createPartyRoom(req: Request, res: Response) {
   }
 
   const roomCode = room_type === "private" ? generateRoomCode() : null
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
 
   const { data: room, error: roomError } = await supabase
     .from("party_rooms")
@@ -123,6 +204,7 @@ export async function createPartyRoom(req: Request, res: Response) {
       missing_roles: missingRoles,
       average_rank: target_rank,
       status: "open",
+      expires_at: expiresAt,
     })
     .select()
     .single()
@@ -138,19 +220,20 @@ export async function createPartyRoom(req: Request, res: Response) {
     })
     .eq("id", chat.id)
 
-  const { error: memberError } = await supabase
-    .from("party_members")
-    .insert({
-      party_room_id: room.id,
-      user_id: ownerId,
-      role_in_game: selected_role,
-      is_owner: true,
-      is_ready: false,
-    })
+  const { error: memberError } = await supabase.from("party_members").insert({
+    party_room_id: room.id,
+    user_id: ownerId,
+    role_in_game: selected_role,
+    is_owner: true,
+    is_ready: false,
+    expires_at: expiresAt,
+  })
 
   if (memberError) {
     return res.status(400).json({ message: memberError.message })
   }
+
+  io.emit("party_room_created", room)
 
   return res.status(201).json({
     message: "Party room berhasil dibuat",
@@ -164,6 +247,21 @@ export async function joinPartyRoom(req: Request, res: Response) {
   const { roomId } = req.params
   const { role_in_game } = req.body
 
+  const activeRoom = await getActiveUserRoom(userId)
+
+  if (activeRoom) {
+    const activeRoomId = (activeRoom as any).party_room_id
+
+    if (activeRoomId === roomId) {
+      return res.status(400).json({
+        code: "ALREADY_IN_THIS_ROOM",
+        message: "Kamu sudah join room ini.",
+      })
+    }
+
+    return activeRoomResponse(res)
+  }
+
   const { data: room, error: roomError } = await supabase
     .from("party_rooms")
     .select("*")
@@ -174,23 +272,18 @@ export async function joinPartyRoom(req: Request, res: Response) {
     return res.status(404).json({ message: "Room tidak ditemukan" })
   }
 
+  if (room.room_type === "private") {
+    return res.status(400).json({
+      message: "Room private wajib join menggunakan room code.",
+    })
+  }
+
   if (room.status === "closed") {
     return res.status(400).json({ message: "Room sudah ditutup" })
   }
 
   if (room.status !== "open" && room.status !== "cooldown") {
     return res.status(400).json({ message: "Room tidak terbuka" })
-  }
-
-  const { data: existingMember } = await supabase
-    .from("party_members")
-    .select("*")
-    .eq("party_room_id", roomId)
-    .eq("user_id", userId)
-    .maybeSingle()
-
-  if (existingMember) {
-    return res.status(400).json({ message: "Kamu sudah join room ini" })
   }
 
   const { count } = await supabase
@@ -208,12 +301,17 @@ export async function joinPartyRoom(req: Request, res: Response) {
     role_in_game,
     is_owner: false,
     is_ready: false,
+    expires_at:
+      room.expires_at ||
+      new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
   })
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({ message: error.message })
+  }
 
   const missingRoles = (room.missing_roles || []).filter(
-    (role: string) => role !== role_in_game
+    (item: string) => item !== role_in_game
   )
 
   const newCount = (count || 0) + 1
@@ -232,6 +330,8 @@ export async function joinPartyRoom(req: Request, res: Response) {
     role_in_game,
   })
 
+  io.emit("party_rooms_updated")
+
   return res.json({
     message: "Berhasil join party",
   })
@@ -240,6 +340,9 @@ export async function joinPartyRoom(req: Request, res: Response) {
 export async function joinPartyRoomByCode(req: Request, res: Response) {
   const userId = req.user.id
   const { room_code, role_in_game } = req.body
+
+  const activeRoom = await getActiveUserRoom(userId)
+  if (activeRoom) return activeRoomResponse(res)
 
   if (!room_code) {
     return res.status(400).json({
@@ -250,7 +353,7 @@ export async function joinPartyRoomByCode(req: Request, res: Response) {
   const { data: room, error: roomError } = await supabase
     .from("party_rooms")
     .select("*")
-    .eq("room_code", room_code.toUpperCase())
+    .eq("room_code", String(room_code).toUpperCase())
     .single()
 
   if (roomError || !room) {
@@ -271,16 +374,9 @@ export async function joinPartyRoomByCode(req: Request, res: Response) {
     })
   }
 
-  const { data: existingMember } = await supabase
-    .from("party_members")
-    .select("*")
-    .eq("party_room_id", room.id)
-    .eq("user_id", userId)
-    .maybeSingle()
-
-  if (existingMember) {
+  if (room.status !== "open" && room.status !== "cooldown") {
     return res.status(400).json({
-      message: "Kamu sudah join room ini",
+      message: "Room tidak terbuka",
     })
   }
 
@@ -301,20 +397,36 @@ export async function joinPartyRoomByCode(req: Request, res: Response) {
     role_in_game,
     is_owner: false,
     is_ready: false,
+    expires_at:
+      room.expires_at ||
+      new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
   })
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({ message: error.message })
+  }
 
   const missingRoles = (room.missing_roles || []).filter(
-    (role: string) => role !== role_in_game
+    (item: string) => item !== role_in_game
   )
+
+  const newCount = (count || 0) + 1
 
   await supabase
     .from("party_rooms")
     .update({
       missing_roles: missingRoles,
+      status: newCount >= room.max_players ? "full" : "open",
     })
     .eq("id", room.id)
+
+  io.to(room.chat_id).emit("party_member_joined", {
+    roomId: room.id,
+    userId,
+    role_in_game,
+  })
+
+  io.emit("party_rooms_updated")
 
   return res.json({
     message: "Berhasil join private room",
@@ -351,7 +463,14 @@ export async function leavePartyRoom(req: Request, res: Response) {
     .eq("party_room_id", roomId)
     .eq("user_id", userId)
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({ message: error.message })
+  }
+
+  const { count } = await supabase
+    .from("party_members")
+    .select("*", { count: "exact", head: true })
+    .eq("party_room_id", roomId)
 
   if (member.is_owner) {
     const cooldownUntil = new Date(Date.now() + 3 * 60 * 1000).toISOString()
@@ -368,8 +487,11 @@ export async function leavePartyRoom(req: Request, res: Response) {
     io.to(room?.chat_id).emit("room_owner_left", {
       roomId,
       cooldown_until: cooldownUntil,
-      message: "Owner keluar. Room akan ditutup dalam 3 menit jika tidak ada owner baru.",
+      message:
+        "Owner keluar. Room akan ditutup dalam 3 menit jika tidak ada owner baru.",
     })
+
+    io.emit("party_rooms_updated")
 
     return res.json({
       message: "Owner keluar. Room masuk cooldown 3 menit.",
@@ -380,7 +502,7 @@ export async function leavePartyRoom(req: Request, res: Response) {
   await supabase
     .from("party_rooms")
     .update({
-      status: "open",
+      status: (count || 0) >= room?.max_players ? "full" : "open",
     })
     .eq("id", roomId)
 
@@ -388,6 +510,8 @@ export async function leavePartyRoom(req: Request, res: Response) {
     roomId,
     userId,
   })
+
+  io.emit("party_rooms_updated")
 
   return res.json({
     message: "Berhasil keluar party",
@@ -447,6 +571,8 @@ export async function transferRoomOwnership(req: Request, res: Response) {
     })
     .eq("id", roomId)
 
+  io.emit("party_rooms_updated")
+
   return res.json({
     message: "Ownership berhasil dipindahkan",
   })
@@ -461,7 +587,9 @@ export async function closeExpiredCooldownRooms(req: Request, res: Response) {
     .eq("status", "cooldown")
     .lte("cooldown_until", now)
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({ message: error.message })
+  }
 
   const ids = rooms?.map((room) => room.id) || []
 
@@ -479,6 +607,8 @@ export async function closeExpiredCooldownRooms(req: Request, res: Response) {
       closed_at: now,
     })
     .in("id", ids)
+
+  io.emit("party_rooms_updated")
 
   return res.json({
     message: "Expired cooldown rooms ditutup",

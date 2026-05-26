@@ -21,6 +21,8 @@ export async function register(req: Request, res: Response) {
         email,
         password: hashedPassword,
         role: "user",
+        status: "active",
+        is_muted: false,
       })
       .select()
       .single()
@@ -36,6 +38,7 @@ export async function register(req: Request, res: Response) {
       username,
       display_name: username,
       online_status: false,
+      last_online: new Date().toISOString(),
     })
 
     if (profileError) {
@@ -52,9 +55,9 @@ export async function register(req: Request, res: Response) {
         role: user.role,
       },
     })
-  } catch {
+  } catch (error: any) {
     return res.status(500).json({
-      message: "Server error",
+      message: error.message || "Server error",
     })
   }
 }
@@ -65,7 +68,18 @@ export async function login(req: Request, res: Response) {
 
     const { data: user, error } = await supabase
       .from("users")
-      .select("*")
+      .select(`
+        id,
+        email,
+        password,
+        role,
+        status,
+        banned_reason,
+        banned_until,
+        is_muted,
+        muted_reason,
+        muted_until
+      `)
       .eq("email", email)
       .single()
 
@@ -75,10 +89,28 @@ export async function login(req: Request, res: Response) {
       })
     }
 
-    if (user.is_banned) {
-      return res.status(403).json({
-        message: "Akun kamu sedang dibanned",
-      })
+    if (user.status === "banned") {
+      const bannedUntil = user.banned_until
+        ? new Date(user.banned_until)
+        : null
+
+      if (!bannedUntil || bannedUntil > new Date()) {
+        return res.status(403).json({
+          code: "USER_BANNED",
+          message: "Akun kamu terkena ban",
+          reason: user.banned_reason || "Melanggar aturan platform",
+          banned_until: user.banned_until,
+        })
+      }
+
+      await supabase
+        .from("users")
+        .update({
+          status: "active",
+          banned_reason: null,
+          banned_until: null,
+        })
+        .eq("id", user.id)
     }
 
     const validPassword = await bcrypt.compare(password, user.password)
@@ -115,11 +147,13 @@ export async function login(req: Request, res: Response) {
         id: user.id,
         email: user.email,
         role: user.role,
+        status: user.status,
+        is_muted: user.is_muted,
       },
     })
-  } catch {
+  } catch (error: any) {
     return res.status(500).json({
-      message: "Server error",
+      message: error.message || "Server error",
     })
   }
 }
@@ -127,7 +161,7 @@ export async function login(req: Request, res: Response) {
 export async function me(req: Request, res: Response) {
   const userId = req.user.id
 
-  const { data, error } = await supabase
+  const { data: profile, error } = await supabase
     .from("profiles")
     .select("*")
     .eq("id", userId)
@@ -141,6 +175,6 @@ export async function me(req: Request, res: Response) {
 
   return res.json({
     user: req.user,
-    profile: data,
+    profile,
   })
 }

@@ -81,13 +81,14 @@ export async function getAdminUsers(req: Request, res: Response) {
 
 export async function banUser(req: Request, res: Response) {
   const { userId } = req.params
-  const { reason } = req.body
+  const { reason, banned_until } = req.body
 
   const { data, error } = await supabase
     .from("users")
     .update({
       status: "banned",
-      banned_reason: reason || "Banned by admin",
+      banned_reason: reason || "Melanggar aturan platform",
+      banned_until: banned_until || null,
     })
     .eq("id", userId)
     .select()
@@ -98,6 +99,20 @@ export async function banUser(req: Request, res: Response) {
       message: error.message,
     })
   }
+
+  await supabase
+    .from("profiles")
+    .update({
+      online_status: false,
+      last_online: new Date().toISOString(),
+    })
+    .eq("id", userId)
+
+  io.to(`user:${userId}`).emit("force_logout", {
+    message: "Akun kamu terkena ban",
+    reason: data.banned_reason,
+    banned_until: data.banned_until,
+  })
 
   return res.json({
     message: "User berhasil diban",
@@ -113,6 +128,7 @@ export async function unbanUser(req: Request, res: Response) {
     .update({
       status: "active",
       banned_reason: null,
+      banned_until: null,
     })
     .eq("id", userId)
     .select()
@@ -132,13 +148,14 @@ export async function unbanUser(req: Request, res: Response) {
 
 export async function muteUser(req: Request, res: Response) {
   const { userId } = req.params
-  const { reason } = req.body
+  const { reason, muted_until } = req.body
 
   const { data, error } = await supabase
     .from("users")
     .update({
       is_muted: true,
-      muted_reason: reason || "Muted by admin",
+      muted_reason: reason || "Toxic chat",
+      muted_until: muted_until || null,
     })
     .eq("id", userId)
     .select()
@@ -149,6 +166,12 @@ export async function muteUser(req: Request, res: Response) {
       message: error.message,
     })
   }
+
+  io.to(`user:${userId}`).emit("user_muted", {
+    message: "Kamu terkena mute",
+    reason: data.muted_reason,
+    muted_until: data.muted_until,
+  })
 
   return res.json({
     message: "User berhasil dimute",
@@ -164,6 +187,7 @@ export async function unmuteUser(req: Request, res: Response) {
     .update({
       is_muted: false,
       muted_reason: null,
+      muted_until: null,
     })
     .eq("id", userId)
     .select()

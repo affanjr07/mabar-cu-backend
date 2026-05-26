@@ -1,6 +1,7 @@
 import { Router } from "express"
 import { authMiddleware } from "../middlewares/auth.middleware"
 import { roleMiddleware } from "../middlewares/role.middleware"
+import { muteMiddleware } from "../middlewares/mute.middleware"
 import {
   createCommunityChannel,
   getCommunityChannels,
@@ -21,6 +22,7 @@ router.get(
 router.post(
   "/channels/:channelId/messages",
   authMiddleware,
+  muteMiddleware,
   sendCommunityMessage
 )
 

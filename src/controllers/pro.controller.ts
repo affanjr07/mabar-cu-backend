@@ -127,6 +127,54 @@ export async function createProBooking(req: Request, res: Response) {
     })
   }
 
+  const duration = Number(duration_hours)
+
+  if (!duration || duration <= 0) {
+    return res.status(400).json({
+      message: "Durasi booking tidak valid",
+    })
+  }
+
+  const startAt = new Date(scheduled_at)
+  const endAt = new Date(startAt.getTime() + duration * 60 * 60 * 1000)
+
+  if (startAt.getTime() < Date.now()) {
+    return res.status(400).json({
+      message: "Jadwal booking tidak boleh di masa lalu",
+    })
+  }
+
+  const { data: activeUserBooking } = await supabase
+    .from("pro_player_bookings")
+    .select("id, status")
+    .eq("requester_id", requesterId)
+    .eq("pro_player_id", pro_player_id)
+    .in("status", ["pending_payment", "pending", "accepted"])
+    .maybeSingle()
+
+  if (activeUserBooking) {
+    return res.status(400).json({
+      message:
+        "Kamu masih punya booking aktif dengan pro player ini. Selesaikan dulu sebelum booking lagi.",
+    })
+  }
+
+  const { data: conflictBooking } = await supabase
+    .from("pro_player_bookings")
+    .select("id, scheduled_at, session_end_at, status")
+    .eq("pro_player_id", pro_player_id)
+    .in("status", ["pending", "accepted"])
+    .lt("scheduled_at", endAt.toISOString())
+    .gt("session_end_at", startAt.toISOString())
+    .maybeSingle()
+
+  if (conflictBooking) {
+    return res.status(400).json({
+      message:
+        "Jadwal pro player bentrok dengan booking lain. Pilih jam lain.",
+    })
+  }
+
   const { data: proUser, error: proUserError } = await supabase
     .from("users")
     .select("id, role")
@@ -151,31 +199,27 @@ export async function createProBooking(req: Request, res: Response) {
     })
   }
 
-  const pricePerHour = settings?.price_per_hour || 1000
-  const totalPrice = pricePerHour * Number(duration_hours)
-  const durationMinutes = Number(duration_hours) * 60
+  const pricePerHour = Number(settings?.price_per_hour || 1000)
+  const totalPrice = pricePerHour * duration
+  const durationMinutes = duration * 60
 
   const insertPayload: any = {
     requester_id: requesterId,
     pro_player_id,
-    duration_hours: Number(duration_hours),
+    duration_hours: duration,
     duration_minutes: durationMinutes,
-    scheduled_at,
-    session_date: scheduled_at,
+    scheduled_at: startAt.toISOString(),
+    session_date: startAt.toISOString(),
+    session_end_at: endAt.toISOString(),
     note: note || null,
     notes: note || null,
     price: totalPrice,
-    payment_status: "pending_demo",
+    payment_status: "unpaid",
     status: "pending_payment",
   }
 
-  if (game_id) {
-    insertPayload.game_id = game_id
-  }
-
-  if (game) {
-    insertPayload.game = game
-  }
+  if (game_id) insertPayload.game_id = game_id
+  if (game) insertPayload.game = game
 
   const { data: booking, error } = await supabase
     .from("pro_player_bookings")
@@ -226,21 +270,43 @@ export async function payDemoBooking(req: Request, res: Response) {
     .single()
 
   if (bookingError || !booking) {
-    return res.status(404).json({
-      message: "Booking tidak ditemukan",
-    })
+    return res.status(404).json({ message: "Booking tidak ditemukan" })
   }
 
   if (booking.requester_id !== userId) {
-    return res.status(403).json({
-      message: "Kamu tidak punya akses ke booking ini",
-    })
+    return res.status(403).json({ message: "Kamu bukan pemilik booking ini" })
   }
 
   if (booking.payment_status === "paid_demo") {
-    return res.status(400).json({
-      message: "Booking ini sudah dibayar demo",
+    return res.status(400).json({ message: "Booking sudah dibayar" })
+  }
+
+  const price = Number(booking.price || 0)
+
+  const { data: wallet, error: walletError } = await supabase
+    .from("wallets")
+    .select("*")
+    .eq("user_id", userId)
+    .single()
+
+  if (walletError || !wallet) {
+    return res.status(404).json({ message: "Wallet tidak ditemukan" })
+  }
+
+  if (Number(wallet.balance) < price) {
+    return res.status(400).json({ message: "Point tidak cukup" })
+  }
+
+  const { error: deductError } = await supabase
+    .from("wallets")
+    .update({
+      balance: Number(wallet.balance) - price,
+      updated_at: new Date().toISOString(),
     })
+    .eq("user_id", userId)
+
+  if (deductError) {
+    return res.status(400).json({ message: deductError.message })
   }
 
   const { data: updated, error } = await supabase
@@ -248,6 +314,7 @@ export async function payDemoBooking(req: Request, res: Response) {
     .update({
       payment_status: "paid_demo",
       status: "pending",
+      paid_at: new Date().toISOString(),
     })
     .eq("id", bookingId)
     .select()
@@ -257,31 +324,17 @@ export async function payDemoBooking(req: Request, res: Response) {
     return res.status(400).json({ message: error.message })
   }
 
-  const { data: notification } = await supabase
-    .from("notifications")
-    .insert({
-      user_id: booking.pro_player_id,
-      sender_id: userId,
-      type: "pro_booking_paid_demo",
-      title: "Booking VIP baru",
-      message:
-        "Ada booking VIP yang sudah dibayar demo. Terima atau tolak sekarang.",
-      data: {
-        bookingId,
-      },
-    })
-    .select()
-    .single()
-
-  if (notification) {
-    io.to(`user:${booking.pro_player_id}`).emit(
-      "notification_received",
-      notification
-    )
-  }
+  await supabase.from("wallet_transactions").insert({
+    user_id: userId,
+    target_user_id: booking.pro_player_id,
+    type: "pro_booking_payment",
+    amount: price,
+    status: "success",
+    message: `Payment booking VIP ${bookingId}`,
+  })
 
   return res.json({
-    message: "Pembayaran demo berhasil. Menunggu respon pro player.",
+    message: "Pembayaran berhasil. Menunggu pro player menerima booking.",
     booking: updated,
   })
 }
@@ -297,9 +350,7 @@ export async function acceptProBooking(req: Request, res: Response) {
     .single()
 
   if (bookingError || !booking) {
-    return res.status(404).json({
-      message: "Booking tidak ditemukan",
-    })
+    return res.status(404).json({ message: "Booking tidak ditemukan" })
   }
 
   if (booking.pro_player_id !== proPlayerId && req.user.role !== "admin") {
@@ -309,15 +360,69 @@ export async function acceptProBooking(req: Request, res: Response) {
   }
 
   if (booking.payment_status !== "paid_demo") {
-    return res.status(400).json({
-      message: "Booking belum dibayar demo",
+    return res.status(400).json({ message: "Booking belum dibayar user" })
+  }
+
+  if (booking.status === "accepted") {
+    return res.status(400).json({ message: "Booking sudah diterima" })
+  }
+
+  const price = Number(booking.price || 0)
+  const platformFee = Math.floor(price * 0.2)
+  const proEarning = price - platformFee
+
+  const { data: proWallet } = await supabase
+    .from("wallets")
+    .select("*")
+    .eq("user_id", booking.pro_player_id)
+    .maybeSingle()
+
+  if (!proWallet) {
+    await supabase.from("wallets").insert({
+      user_id: booking.pro_player_id,
+      balance: 0,
+      total_topup: 0,
+      total_gift_sent: 0,
+      total_gift_received: 0,
     })
+  }
+
+  const { data: latestProWallet } = await supabase
+    .from("wallets")
+    .select("*")
+    .eq("user_id", booking.pro_player_id)
+    .single()
+
+  await supabase
+    .from("wallets")
+    .update({
+      balance: Number(latestProWallet.balance || 0) + proEarning,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", booking.pro_player_id)
+
+  const { data: chat, error: chatError } = await supabase
+    .from("pro_booking_chats")
+    .insert({
+      booking_id: booking.id,
+      user_id: booking.requester_id,
+      pro_player_id: booking.pro_player_id,
+    })
+    .select()
+    .single()
+
+  if (chatError) {
+    return res.status(400).json({ message: chatError.message })
   }
 
   const { data: updated, error } = await supabase
     .from("pro_player_bookings")
     .update({
       status: "accepted",
+      accepted_at: new Date().toISOString(),
+      platform_fee: platformFee,
+      pro_earning: proEarning,
+      chat_id: chat.id,
     })
     .eq("id", bookingId)
     .select()
@@ -327,31 +432,19 @@ export async function acceptProBooking(req: Request, res: Response) {
     return res.status(400).json({ message: error.message })
   }
 
-  const { data: notification } = await supabase
-    .from("notifications")
-    .insert({
-      user_id: booking.requester_id,
-      sender_id: proPlayerId,
-      type: "pro_booking_accepted",
-      title: "Booking VIP diterima",
-      message: "Pro player menerima booking VIP kamu.",
-      data: {
-        bookingId,
-      },
-    })
-    .select()
-    .single()
-
-  if (notification) {
-    io.to(`user:${booking.requester_id}`).emit(
-      "notification_received",
-      notification
-    )
-  }
+  await supabase.from("wallet_transactions").insert({
+    user_id: booking.pro_player_id,
+    target_user_id: booking.requester_id,
+    type: "pro_booking_income",
+    amount: proEarning,
+    status: "success",
+    message: `Income booking VIP ${bookingId}, fee platform ${platformFee}`,
+  })
 
   return res.json({
-    message: "Booking berhasil diterima",
+    message: "Booking diterima. Chat VIP sudah dibuka.",
     booking: updated,
+    chat,
   })
 }
 
@@ -378,12 +471,66 @@ export async function rejectProBooking(req: Request, res: Response) {
     })
   }
 
+  if (booking.status === "accepted") {
+    return res.status(400).json({
+      message: "Booking sudah diterima, tidak bisa ditolak",
+    })
+  }
+
+  if (booking.status === "rejected") {
+    return res.status(400).json({
+      message: "Booking sudah ditolak",
+    })
+  }
+
+  const price = Number(booking.price || 0)
+
+  if (booking.payment_status === "paid_demo") {
+    const { data: userWallet, error: walletError } = await supabase
+      .from("wallets")
+      .select("*")
+      .eq("user_id", booking.requester_id)
+      .single()
+
+    if (walletError || !userWallet) {
+      return res.status(404).json({
+        message: "Wallet user tidak ditemukan untuk refund",
+      })
+    }
+
+    const { error: refundError } = await supabase
+      .from("wallets")
+      .update({
+        balance: Number(userWallet.balance || 0) + price,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", booking.requester_id)
+
+    if (refundError) {
+      return res.status(400).json({
+        message: refundError.message,
+      })
+    }
+
+    await supabase.from("wallet_transactions").insert({
+      user_id: booking.requester_id,
+      target_user_id: booking.pro_player_id,
+      type: "pro_booking_refund",
+      amount: price,
+      status: "success",
+      message: `Refund booking VIP ${bookingId}`,
+    })
+  }
+
   const rejectNote = reason || "Ditolak oleh pro player"
 
   const { data: updated, error } = await supabase
     .from("pro_player_bookings")
     .update({
       status: "rejected",
+      payment_status:
+        booking.payment_status === "paid_demo" ? "refunded" : booking.payment_status,
+      rejected_at: new Date().toISOString(),
       notes: rejectNote,
       note: rejectNote,
     })
@@ -402,7 +549,10 @@ export async function rejectProBooking(req: Request, res: Response) {
       sender_id: proPlayerId,
       type: "pro_booking_rejected",
       title: "Booking VIP ditolak",
-      message: rejectNote,
+      message:
+        booking.payment_status === "paid_demo"
+          ? `${rejectNote}. Point sudah dikembalikan.`
+          : rejectNote,
       data: {
         bookingId,
       },
@@ -418,7 +568,10 @@ export async function rejectProBooking(req: Request, res: Response) {
   }
 
   return res.json({
-    message: "Booking berhasil ditolak",
+    message:
+      booking.payment_status === "paid_demo"
+        ? "Booking ditolak dan point user dikembalikan"
+        : "Booking berhasil ditolak",
     booking: updated,
   })
 }

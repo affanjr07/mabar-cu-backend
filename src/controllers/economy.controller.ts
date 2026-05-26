@@ -279,6 +279,23 @@ export async function getShopItems(req: Request, res: Response) {
   return res.json(data)
 }
 
+export async function getWalletTransactions(req: Request, res: Response) {
+  const userId = req.user.id
+
+  const { data, error } = await supabase
+    .from("wallet_transactions")
+    .select("*")
+    .or(`user_id.eq.${userId},target_user_id.eq.${userId}`)
+    .order("created_at", { ascending: false })
+    .limit(50)
+
+  if (error) {
+    return res.status(400).json({ message: error.message })
+  }
+
+  return res.json(data || [])
+}
+
 export async function buyShopItem(req: Request, res: Response) {
   try {
     const userId = req.user.id
@@ -409,68 +426,87 @@ export async function getMyInventory(req: Request, res: Response) {
 }
 
 export async function equipItem(req: Request, res: Response) {
-  try {
-    const userId = req.user.id
-    const { inventoryId } = req.params
+  const userId = req.user.id
+  const { inventoryId } = req.params
 
-    const { data: inventory, error: inventoryError } = await supabase
-      .from("user_inventory")
-      .select(`
+  const { data: inventory, error } = await supabase
+    .from("user_inventory")
+    .select(`
+      id,
+      user_id,
+      is_equipped,
+      shop_items (
         id,
-        user_id,
-        item_id,
-        shop_items (
-          id,
-          type,
-          name,
-          css_class,
-          image_url,
-          metadata
-        )
-      `)
-      .eq("id", inventoryId)
-      .eq("user_id", userId)
-      .single()
+        type,
+        name
+      )
+    `)
+    .eq("id", inventoryId)
+    .eq("user_id", userId)
+    .single()
 
-    if (inventoryError || !inventory) {
-      return res.status(404).json({
-        message: "Item inventory tidak ditemukan",
-      })
-    }
-
-    const item: any = inventory.shop_items
-    const itemType = item.type
-
-    await supabase
-      .from("user_inventory")
-      .update({
-        is_equipped: false,
-      })
-      .eq("user_id", userId)
-      .eq("shop_items.type", itemType)
-
-    const { data: equipped, error } = await supabase
-      .from("user_inventory")
-      .update({
-        is_equipped: true,
-      })
-      .eq("id", inventoryId)
-      .select(`
-        id,
-        is_equipped,
-        shop_items (*)
-      `)
-      .single()
-
-    if (error) return res.status(400).json({ message: error.message })
-
-    return res.json({
-      message: "Item berhasil dipakai",
-      inventory: equipped,
-    })
-  } catch (error: any) {
-    return res.status(500).json({
-      message: error.message,
+  if (error || !inventory) {
+    return res.status(404).json({
+      message: "Item inventory tidak ditemukan",
     })
   }
+
+  const itemType = (inventory.shop_items as any)?.type
+
+  if (itemType === "avatar_border") {
+    await supabase
+      .from("user_inventory")
+      .update({ is_equipped: false })
+      .eq("user_id", userId)
+      .eq("shop_items.type", "avatar_border")
+
+    const { error: updateError } = await supabase
+      .from("user_inventory")
+      .update({ is_equipped: true })
+      .eq("id", inventoryId)
+
+    if (updateError) {
+      return res.status(400).json({ message: updateError.message })
+    }
+
+    return res.json({
+      message: "Avatar border berhasil diganti",
+    })
+  }
+
+  if (itemType === "badge") {
+    if (!inventory.is_equipped) {
+      const { count } = await supabase
+        .from("user_inventory")
+        .select("*", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("is_equipped", true)
+        .eq("shop_items.type", "badge")
+
+      if ((count || 0) >= 5) {
+        return res.status(400).json({
+          message: "Maksimal hanya bisa memakai 5 badge",
+        })
+      }
+    }
+
+    const { error: updateError } = await supabase
+      .from("user_inventory")
+      .update({ is_equipped: !inventory.is_equipped })
+      .eq("id", inventoryId)
+
+    if (updateError) {
+      return res.status(400).json({ message: updateError.message })
+    }
+
+    return res.json({
+      message: inventory.is_equipped
+        ? "Badge berhasil dilepas"
+        : "Badge berhasil dipakai",
+    })
+  }
+
+  return res.status(400).json({
+    message: "Tipe item tidak bisa dipakai",
+  })
 }
