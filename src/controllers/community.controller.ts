@@ -3,14 +3,50 @@ import { supabase } from "../config/supabase"
 import { io } from "../server"
 import { moderateText } from "../services/moderation.service"
 
+function createSlug(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "")
+}
+
+async function syncCommunityChannelsFromGames() {
+  const { data: games, error: gamesError } = await supabase
+    .from("games")
+    .select("id, name, genre")
+    .order("name", { ascending: true })
+
+  if (gamesError || !games) return
+
+  const { data: channels } = await supabase
+    .from("community_channels")
+    .select("game_id")
+
+  const existingGameIds = new Set(
+    (channels || []).map((channel: any) => channel.game_id)
+  )
+
+  const missingChannels = games
+    .filter((game: any) => !existingGameIds.has(game.id))
+    .map((game: any) => ({
+      game_id: game.id,
+      name: `${game.name} Community`,
+      slug: createSlug(game.name),
+      description: `Community chat untuk player ${game.name}`,
+      is_active: true,
+    }))
+
+  if (missingChannels.length > 0) {
+    await supabase.from("community_channels").insert(missingChannels)
+  }
+}
+
 async function hydrateCommunityMessages(messages: any[]) {
   const senderIds = [
     ...new Set(messages.map((message) => message.sender_id).filter(Boolean)),
   ]
 
-  if (senderIds.length === 0) {
-    return messages
-  }
+  if (senderIds.length === 0) return messages
 
   const { data: profiles } = await supabase
     .from("profiles")
@@ -19,6 +55,7 @@ async function hydrateCommunityMessages(messages: any[]) {
       username,
       display_name,
       avatar_url,
+      role,
       online_status
     `)
     .in("id", senderIds)
@@ -43,7 +80,7 @@ async function hydrateCommunityMessages(messages: any[]) {
 
   return messages.map((message) => {
     const profile = profiles?.find(
-      (profileItem) => profileItem.id === message.sender_id
+      (profileItem: any) => profileItem.id === message.sender_id
     )
 
     const userEquippedItems =
@@ -80,13 +117,13 @@ async function moderateCommunityText(content: string) {
   let moderationRaw: any = null
 
   try {
-    const moderation = await moderateText(content)
+    const moderation: any = await moderateText(content)
 
-    isFlagged = moderation.flagged
-    moderationStatus = moderation.flagged ? "flagged" : "safe"
+    isFlagged = Boolean(moderation.flagged || moderation.isFlagged)
+    moderationStatus = isFlagged ? "flagged" : "safe"
     moderationRaw = moderation.raw || moderation
   } catch (error: any) {
-    console.log("OpenAI community moderation failed:", error.message)
+    console.log("Community moderation failed:", error.message)
   }
 
   return {
@@ -98,6 +135,8 @@ async function moderateCommunityText(content: string) {
 
 export async function getCommunityChannels(req: Request, res: Response) {
   const { gameId } = req.query
+
+  await syncCommunityChannelsFromGames()
 
   let query = supabase
     .from("community_channels")
@@ -112,7 +151,10 @@ export async function getCommunityChannels(req: Request, res: Response) {
       games (
         id,
         name,
-        genre
+        genre,
+        max_party_size,
+        roles,
+        ranks
       )
     `)
     .eq("is_active", true)
@@ -219,7 +261,7 @@ export async function sendCommunityMessage(req: Request, res: Response) {
     .insert({
       channel_id: channelId,
       sender_id: userId,
-      content,
+      content: content.trim(),
       is_flagged: isFlagged,
       moderation_status: moderationStatus,
     })
@@ -247,7 +289,7 @@ export async function sendCommunityMessage(req: Request, res: Response) {
       target_id: message.id,
       provider: "openai",
       status: "flagged",
-      reason: "Community chat message flagged by OpenAI Moderation",
+      reason: "Community chat message flagged by moderation",
       raw_response: moderationRaw,
     })
   }
@@ -270,9 +312,23 @@ export async function sendCommunityMessage(req: Request, res: Response) {
 export async function createCommunityChannel(req: Request, res: Response) {
   const { game_id, name, slug, description } = req.body
 
-  if (!game_id || !name || !slug) {
+  if (!game_id || !name) {
     return res.status(400).json({
-      message: "game_id, name, dan slug wajib diisi",
+      message: "game_id dan name wajib diisi",
+    })
+  }
+
+  const finalSlug = slug || createSlug(name)
+
+  const { data: existing } = await supabase
+    .from("community_channels")
+    .select("id")
+    .eq("game_id", game_id)
+    .maybeSingle()
+
+  if (existing) {
+    return res.status(400).json({
+      message: "Channel untuk game ini sudah ada",
     })
   }
 
@@ -281,11 +337,27 @@ export async function createCommunityChannel(req: Request, res: Response) {
     .insert({
       game_id,
       name,
-      slug,
+      slug: finalSlug,
       description,
       is_active: true,
     })
-    .select()
+    .select(`
+      id,
+      game_id,
+      name,
+      slug,
+      description,
+      is_active,
+      created_at,
+      games (
+        id,
+        name,
+        genre,
+        max_party_size,
+        roles,
+        ranks
+      )
+    `)
     .single()
 
   if (error) {
