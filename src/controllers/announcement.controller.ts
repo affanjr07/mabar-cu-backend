@@ -1,10 +1,9 @@
 import { Request, Response } from "express"
 import { supabase } from "../config/supabase"
-import { io } from "../server"
 
 export async function createAnnouncement(req: Request, res: Response) {
   const adminId = req.user.id
-  const { title, message, starts_at, ends_at } = req.body
+  const { title, message, starts_at, ends_at, type = "info" } = req.body
 
   if (!title || !message) {
     return res.status(400).json({
@@ -17,6 +16,7 @@ export async function createAnnouncement(req: Request, res: Response) {
     .insert({
       title,
       message,
+      type,
       starts_at: starts_at || null,
       ends_at: ends_at || null,
       created_by: adminId,
@@ -26,12 +26,8 @@ export async function createAnnouncement(req: Request, res: Response) {
     .single()
 
   if (error) {
-    return res.status(400).json({
-      message: error.message,
-    })
+    return res.status(400).json({ message: error.message })
   }
-
-  io.emit("announcement_received", data)
 
   return res.status(201).json({
     message: "Announcement berhasil dibuat",
@@ -51,12 +47,10 @@ export async function getActiveAnnouncements(req: Request, res: Response) {
     .order("created_at", { ascending: false })
 
   if (error) {
-    return res.status(400).json({
-      message: error.message,
-    })
+    return res.status(400).json({ message: error.message })
   }
 
-  return res.json(data)
+  return res.json(data || [])
 }
 
 export async function getAdminAnnouncements(req: Request, res: Response) {
@@ -66,12 +60,10 @@ export async function getAdminAnnouncements(req: Request, res: Response) {
     .order("created_at", { ascending: false })
 
   if (error) {
-    return res.status(400).json({
-      message: error.message,
-    })
+    return res.status(400).json({ message: error.message })
   }
 
-  return res.json(data)
+  return res.json(data || [])
 }
 
 export async function deleteAnnouncement(req: Request, res: Response) {
@@ -79,15 +71,11 @@ export async function deleteAnnouncement(req: Request, res: Response) {
 
   const { error } = await supabase
     .from("announcements")
-    .update({
-      is_active: false,
-    })
+    .update({ is_active: false })
     .eq("id", announcementId)
 
   if (error) {
-    return res.status(400).json({
-      message: error.message,
-    })
+    return res.status(400).json({ message: error.message })
   }
 
   return res.json({
