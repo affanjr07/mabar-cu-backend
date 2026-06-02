@@ -3,7 +3,7 @@ import { supabase } from "../config/supabase"
 
 export async function createAnnouncement(req: Request, res: Response) {
   const adminId = req.user.id
-  const { title, message, starts_at, ends_at, type = "info" } = req.body
+  const { title, message, starts_at, ends_at } = req.body
 
   if (!title || !message) {
     return res.status(400).json({
@@ -13,15 +13,14 @@ export async function createAnnouncement(req: Request, res: Response) {
 
   const { data, error } = await supabase
     .from("announcements")
-    .insert({
-      title,
-      message,
-      type,
-      starts_at: starts_at || null,
-      ends_at: ends_at || null,
-      created_by: adminId,
-      is_active: true,
-    })
+.insert({
+  title,
+  message,
+  starts_at: starts_at || null,
+  ends_at: ends_at || null,
+  created_by: adminId,
+  is_active: true,
+})
     .select()
     .single()
 
