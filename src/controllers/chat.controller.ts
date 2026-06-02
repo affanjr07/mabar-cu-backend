@@ -1,16 +1,35 @@
 import { Request, Response } from "express"
 import { supabase } from "../config/supabase"
-import { io } from "../server"
 import { moderateText } from "../services/moderation.service"
 
+function getParamValue(req: Request, key: string) {
+  const value = req.params[key]
+
+  if (!value || typeof value !== "string") {
+    return null
+  }
+
+  return value
+}
+
 async function hydrateMessages(messages: any[]) {
-  const senderIds = [...new Set(messages.map((m) => m.sender_id).filter(Boolean))]
+  const senderIds = [
+    ...new Set(messages.map((message) => message.sender_id).filter(Boolean)),
+  ]
 
   if (senderIds.length === 0) return messages
 
   const { data: profiles } = await supabase
     .from("profiles")
-    .select("id, username, display_name, avatar_url, online_status")
+    .select(`
+      id,
+      username,
+      display_name,
+      avatar_url,
+      role,
+      online_status,
+      last_online
+    `)
     .in("id", senderIds)
 
   const { data: equippedItems } = await supabase
@@ -32,19 +51,21 @@ async function hydrateMessages(messages: any[]) {
     .eq("is_equipped", true)
 
   return messages.map((message) => {
-    const profile = profiles?.find((p) => p.id === message.sender_id)
+    const profile = profiles?.find(
+      (profileItem: any) => profileItem.id === message.sender_id
+    )
 
-    const userEquipped =
+    const userEquippedItems =
       equippedItems?.filter((item: any) => item.user_id === message.sender_id) ||
       []
 
     const equippedAvatarBorder =
-      userEquipped.find(
+      userEquippedItems.find(
         (item: any) => item.shop_items?.type === "avatar_border"
       )?.shop_items || null
 
     const equippedBadges =
-      userEquipped
+      userEquippedItems
         .filter((item: any) => item.shop_items?.type === "badge")
         .map((item: any) => item.shop_items) || []
 
@@ -53,31 +74,65 @@ async function hydrateMessages(messages: any[]) {
       profiles: profile
         ? {
             ...profile,
+            username: profile.username || profile.display_name || "Player",
+            display_name: profile.display_name || profile.username || "Player",
             equipped_avatar_border: equippedAvatarBorder,
             equipped_badges: equippedBadges,
           }
-        : null,
+        : {
+            id: message.sender_id,
+            username: "Player",
+            display_name: "Player",
+            avatar_url: null,
+            role: "user",
+            online_status: false,
+            last_online: null,
+            equipped_avatar_border: null,
+            equipped_badges: [],
+          },
     }
   })
 }
 
-async function runModeration(content?: string) {
+async function runModeration(content?: string | null) {
   let moderationStatus = "safe"
   let isFlagged = false
+  let moderationRaw: any = null
 
   if (!content) {
-    return { moderationStatus, isFlagged }
+    return {
+      moderationStatus,
+      isFlagged,
+      moderationRaw,
+    }
   }
 
   try {
-    const moderation = await moderateText(content)
-    isFlagged = moderation.flagged
-    moderationStatus = moderation.flagged ? "flagged" : "safe"
-  } catch (error) {
-    console.log("OpenAI moderation failed:", error)
+    const moderation: any = await moderateText(content)
+
+    isFlagged = Boolean(moderation.flagged || moderation.isFlagged)
+    moderationStatus = isFlagged ? "flagged" : "safe"
+    moderationRaw = moderation.raw || moderation
+  } catch (error: any) {
+    console.log("OpenAI moderation failed:", error.message)
   }
 
-  return { moderationStatus, isFlagged }
+  return {
+    moderationStatus,
+    isFlagged,
+    moderationRaw,
+  }
+}
+
+async function userCanAccessChat(chatId: string, userId: string) {
+  const { data: participant } = await supabase
+    .from("chat_participants")
+    .select("id")
+    .eq("chat_id", chatId)
+    .eq("user_id", userId)
+    .maybeSingle()
+
+  return Boolean(participant)
 }
 
 export async function createPrivateChat(req: Request, res: Response) {
@@ -85,11 +140,15 @@ export async function createPrivateChat(req: Request, res: Response) {
   const { targetUserId } = req.body
 
   if (!targetUserId) {
-    return res.status(400).json({ message: "targetUserId wajib diisi" })
+    return res.status(400).json({
+      message: "targetUserId wajib diisi",
+    })
   }
 
   if (userId === targetUserId) {
-    return res.status(400).json({ message: "Tidak bisa chat diri sendiri" })
+    return res.status(400).json({
+      message: "Tidak bisa chat diri sendiri",
+    })
   }
 
   const { data: targetUser } = await supabase
@@ -99,19 +158,35 @@ export async function createPrivateChat(req: Request, res: Response) {
     .maybeSingle()
 
   if (!targetUser) {
-    return res.status(404).json({ message: "Target user tidak ditemukan" })
+    return res.status(404).json({
+      message: "Target user tidak ditemukan",
+    })
+  }
+
+  const { data: blocked } = await supabase
+    .from("blocked_users")
+    .select("id")
+    .or(
+      `and(blocker_id.eq.${userId},blocked_id.eq.${targetUserId}),and(blocker_id.eq.${targetUserId},blocked_id.eq.${userId})`
+    )
+    .maybeSingle()
+
+  if (blocked) {
+    return res.status(403).json({
+      message: "Chat tidak bisa dibuat karena salah satu user memblokir.",
+    })
   }
 
   const { data: follow } = await supabase
     .from("follows")
-    .select("*")
+    .select("id")
     .eq("follower_id", userId)
     .eq("following_id", targetUserId)
     .maybeSingle()
 
   const { data: friend } = await supabase
     .from("friends")
-    .select("*")
+    .select("id")
     .or(
       `and(user_one.eq.${userId},user_two.eq.${targetUserId}),and(user_one.eq.${targetUserId},user_two.eq.${userId})`
     )
@@ -123,16 +198,22 @@ export async function createPrivateChat(req: Request, res: Response) {
     })
   }
 
-  const { data: myParticipants } = await supabase
+  const { data: myParticipants, error: myParticipantsError } = await supabase
     .from("chat_participants")
     .select("chat_id")
     .eq("user_id", userId)
+
+  if (myParticipantsError) {
+    return res.status(400).json({
+      message: myParticipantsError.message,
+    })
+  }
 
   if (myParticipants && myParticipants.length > 0) {
     for (const item of myParticipants) {
       const { data: targetParticipant } = await supabase
         .from("chat_participants")
-        .select("*")
+        .select("id, chat_id, user_id")
         .eq("chat_id", item.chat_id)
         .eq("user_id", targetUserId)
         .maybeSingle()
@@ -156,7 +237,11 @@ export async function createPrivateChat(req: Request, res: Response) {
     .select()
     .single()
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({
+      message: error.message,
+    })
+  }
 
   const { error: participantError } = await supabase
     .from("chat_participants")
@@ -172,7 +257,9 @@ export async function createPrivateChat(req: Request, res: Response) {
     ])
 
   if (participantError) {
-    return res.status(400).json({ message: participantError.message })
+    return res.status(400).json({
+      message: participantError.message,
+    })
   }
 
   return res.status(201).json({
@@ -183,16 +270,17 @@ export async function createPrivateChat(req: Request, res: Response) {
 
 export async function getChatMessages(req: Request, res: Response) {
   const userId = req.user.id
-  const { chatId } = req.params
+  const chatId = getParamValue(req, "chatId")
 
-  const { data: participant } = await supabase
-    .from("chat_participants")
-    .select("*")
-    .eq("chat_id", chatId)
-    .eq("user_id", userId)
-    .maybeSingle()
+  if (!chatId) {
+    return res.status(400).json({
+      message: "chatId wajib diisi",
+    })
+  }
 
-  if (!participant) {
+  const canAccess = await userCanAccessChat(chatId, userId)
+
+  if (!canAccess) {
     return res.status(403).json({
       message: "Kamu tidak punya akses ke chat ini",
     })
@@ -215,19 +303,29 @@ export async function getChatMessages(req: Request, res: Response) {
     `)
     .eq("chat_id", chatId)
     .order("created_at", { ascending: true })
+    .limit(150)
 
   if (error) {
-    return res.status(400).json({ message: error.message })
+    return res.status(400).json({
+      message: error.message,
+    })
   }
 
   const hydrated = await hydrateMessages(data || [])
+
   return res.json(hydrated)
 }
 
 export async function sendMessage(req: Request, res: Response) {
   const senderId = req.user.id
-  const { chatId } = req.params
+  const chatId = getParamValue(req, "chatId")
   const { content, image_url, sticker_url, message_type = "text" } = req.body
+
+  if (!chatId) {
+    return res.status(400).json({
+      message: "chatId wajib diisi",
+    })
+  }
 
   if (!content && !image_url && !sticker_url) {
     return res.status(400).json({
@@ -235,37 +333,50 @@ export async function sendMessage(req: Request, res: Response) {
     })
   }
 
-  const { data: participant } = await supabase
-    .from("chat_participants")
-    .select("*")
-    .eq("chat_id", chatId)
-    .eq("user_id", senderId)
-    .maybeSingle()
+  const canAccess = await userCanAccessChat(chatId, senderId)
 
-  if (!participant) {
+  if (!canAccess) {
     return res.status(403).json({
       message: "Kamu tidak punya akses ke chat ini",
     })
   }
 
-  const { moderationStatus, isFlagged } = await runModeration(content)
+  const { moderationStatus, isFlagged, moderationRaw } = await runModeration(
+    content
+  )
 
   const { data: message, error } = await supabase
     .from("messages")
     .insert({
       chat_id: chatId,
       sender_id: senderId,
-      content,
-      image_url,
-      sticker_url,
+      content: content?.trim() || null,
+      image_url: image_url || null,
+      sticker_url: sticker_url || null,
       message_type,
       is_flagged: isFlagged,
       moderation_status: moderationStatus,
     })
-    .select()
+    .select(`
+      id,
+      chat_id,
+      sender_id,
+      content,
+      image_url,
+      sticker_url,
+      message_type,
+      is_read,
+      is_flagged,
+      moderation_status,
+      created_at
+    `)
     .single()
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({
+      message: error.message,
+    })
+  }
 
   if (isFlagged) {
     await supabase.from("moderation_logs").insert({
@@ -275,31 +386,33 @@ export async function sendMessage(req: Request, res: Response) {
       provider: "openai",
       status: "flagged",
       reason: "Chat message flagged by OpenAI Moderation",
+      raw_response: moderationRaw,
     })
   }
 
   const [hydratedMessage] = await hydrateMessages([message])
 
-  io.to(chatId).emit("message_received", hydratedMessage)
-
   return res.status(201).json({
-    message: "Pesan terkirim",
+    message: isFlagged
+      ? "Pesan terkirim tapi ditandai untuk review moderation"
+      : "Pesan terkirim",
     data: hydratedMessage,
   })
 }
 
 export async function markMessagesAsRead(req: Request, res: Response) {
   const userId = req.user.id
-  const { chatId } = req.params
+  const chatId = getParamValue(req, "chatId")
 
-  const { data: participant } = await supabase
-    .from("chat_participants")
-    .select("*")
-    .eq("chat_id", chatId)
-    .eq("user_id", userId)
-    .maybeSingle()
+  if (!chatId) {
+    return res.status(400).json({
+      message: "chatId wajib diisi",
+    })
+  }
 
-  if (!participant) {
+  const canAccess = await userCanAccessChat(chatId, userId)
+
+  if (!canAccess) {
     return res.status(403).json({
       message: "Kamu tidak punya akses ke chat ini",
     })
@@ -313,7 +426,11 @@ export async function markMessagesAsRead(req: Request, res: Response) {
     .eq("chat_id", chatId)
     .neq("sender_id", userId)
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({
+      message: error.message,
+    })
+  }
 
   return res.json({
     message: "Pesan ditandai sudah dibaca",
@@ -322,14 +439,26 @@ export async function markMessagesAsRead(req: Request, res: Response) {
 
 export async function getRoomChatMessages(req: Request, res: Response) {
   const userId = req.user.id
-  const { roomId } = req.params
+  const roomId = getParamValue(req, "roomId")
 
-  const { data: member } = await supabase
+  if (!roomId) {
+    return res.status(400).json({
+      message: "roomId wajib diisi",
+    })
+  }
+
+  const { data: member, error: memberError } = await supabase
     .from("party_members")
-    .select("*")
+    .select("id, party_room_id, user_id")
     .eq("party_room_id", roomId)
     .eq("user_id", userId)
     .maybeSingle()
+
+  if (memberError) {
+    return res.status(400).json({
+      message: memberError.message,
+    })
+  }
 
   if (!member) {
     return res.status(403).json({
@@ -344,7 +473,9 @@ export async function getRoomChatMessages(req: Request, res: Response) {
     .single()
 
   if (roomError || !room?.chat_id) {
-    return res.status(404).json({ message: "Chat room tidak ditemukan" })
+    return res.status(404).json({
+      message: "Chat room tidak ditemukan",
+    })
   }
 
   if (room.status === "closed") {
@@ -370,8 +501,13 @@ export async function getRoomChatMessages(req: Request, res: Response) {
     `)
     .eq("chat_id", room.chat_id)
     .order("created_at", { ascending: true })
+    .limit(150)
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({
+      message: error.message,
+    })
+  }
 
   const hydrated = await hydrateMessages(data || [])
 
@@ -383,8 +519,14 @@ export async function getRoomChatMessages(req: Request, res: Response) {
 
 export async function sendRoomChatMessage(req: Request, res: Response) {
   const userId = req.user.id
-  const { roomId } = req.params
+  const roomId = getParamValue(req, "roomId")
   const { content } = req.body
+
+  if (!roomId) {
+    return res.status(400).json({
+      message: "roomId wajib diisi",
+    })
+  }
 
   if (!content?.trim()) {
     return res.status(400).json({
@@ -392,12 +534,18 @@ export async function sendRoomChatMessage(req: Request, res: Response) {
     })
   }
 
-  const { data: member } = await supabase
+  const { data: member, error: memberError } = await supabase
     .from("party_members")
-    .select("*")
+    .select("id, party_room_id, user_id")
     .eq("party_room_id", roomId)
     .eq("user_id", userId)
     .maybeSingle()
+
+  if (memberError) {
+    return res.status(400).json({
+      message: memberError.message,
+    })
+  }
 
   if (!member) {
     return res.status(403).json({
@@ -407,7 +555,7 @@ export async function sendRoomChatMessage(req: Request, res: Response) {
 
   const { data: room, error: roomError } = await supabase
     .from("party_rooms")
-    .select("chat_id, status")
+    .select("id, chat_id, status")
     .eq("id", roomId)
     .single()
 
@@ -423,22 +571,40 @@ export async function sendRoomChatMessage(req: Request, res: Response) {
     })
   }
 
-  const { moderationStatus, isFlagged } = await runModeration(content)
+  const { moderationStatus, isFlagged, moderationRaw } = await runModeration(
+    content
+  )
 
   const { data: message, error } = await supabase
     .from("messages")
     .insert({
       chat_id: room.chat_id,
       sender_id: userId,
-      content,
+      content: content.trim(),
       message_type: "text",
       is_flagged: isFlagged,
       moderation_status: moderationStatus,
     })
-    .select()
+    .select(`
+      id,
+      chat_id,
+      sender_id,
+      content,
+      image_url,
+      sticker_url,
+      message_type,
+      is_read,
+      is_flagged,
+      moderation_status,
+      created_at
+    `)
     .single()
 
-  if (error) return res.status(400).json({ message: error.message })
+  if (error) {
+    return res.status(400).json({
+      message: error.message,
+    })
+  }
 
   if (isFlagged) {
     await supabase.from("moderation_logs").insert({
@@ -448,15 +614,16 @@ export async function sendRoomChatMessage(req: Request, res: Response) {
       provider: "openai",
       status: "flagged",
       reason: "Room chat message flagged by OpenAI Moderation",
+      raw_response: moderationRaw,
     })
   }
 
   const [hydratedMessage] = await hydrateMessages([message])
 
-  io.to(room.chat_id).emit("message_received", hydratedMessage)
-
   return res.status(201).json({
-    message: "Pesan room terkirim",
+    message: isFlagged
+      ? "Pesan room terkirim tapi ditandai moderation"
+      : "Pesan room terkirim",
     data: hydratedMessage,
   })
 }
